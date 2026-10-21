@@ -1,0 +1,13 @@
+{
+  "out_dir": "../coin_watch",
+  "window_sec": 300.0,
+  "move_pct": 20.0,
+  "big_trade_sol": 1.0,
+  "early_sec": 10.0,
+  "record_trades": true,
+  "duration_sec": 1500.0,
+  "status_every_sec": 30.0,
+  "max_active": 5000,
+  "url": "wss://pumpportal.fun/api/data",
+  "output_format": "txt"
+}
