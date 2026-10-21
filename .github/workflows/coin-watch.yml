@@ -1,5 +1,7 @@
 # Запуск coin watcher на GitHub Actions (у раннера есть доступ к PumpPortal).
-# Только чтение: одно WebSocket-подключение к PumpPortal, без ключей и транзакций.
+# Только чтение: PumpPortal subscribeNewToken (бесплатно) + цена из кривых Pump.fun через публичный
+# Solana RPC getMultipleAccounts. Без ключей, подписей и транзакций.
+# Свой RPC можно задать секретом репозитория WATCH_RPC_URL (необязательно).
 # Запускается при пуше в эту ветку, если изменился этот файл или coin_watch_request.txt.
 # Результаты коммитятся обратно в ветку в папку coin_watch_results/run_.../
 name: coin-watch
@@ -23,12 +25,14 @@ jobs:
     timeout-minutes: 45
     env:
       DURATION_SEC: '1500'   # 25 минут: монеты первых ~20 минут досматриваются полные 5 минут
+      WATCH_RPC_URL: ${{ secrets.WATCH_RPC_URL }}
+      WATCH_PRICE_SOURCE: rpc
     steps:
       - uses: actions/checkout@v4
       - uses: actions/setup-python@v5
         with:
           python-version: '3.12'
-      - run: pip install 'websockets>=12.0'
+      - run: pip install 'websockets>=12.0' 'aiohttp>=3.9'
       - name: Run coin watcher
         working-directory: solana_sniper
         run: python -m telemetry watch --out-dir ../coin_watch --duration-sec "$DURATION_SEC"
