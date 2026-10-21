@@ -40,6 +40,8 @@ from .solana_addr import creator_ata_candidates, token_account_amount
 PUMP_TOTAL_SUPPLY = 1_000_000_000.0
 PUMP_DECIMALS = 6
 DEFAULT_RPC_URL = 'https://api.mainnet-beta.solana.com'
+PUMP_CURVE_DISCRIMINATOR = bytes.fromhex('17b7f83760d8ac60')   # sha256('account:BondingCurve')[:8]
+CURVE_NOT_FOUND_GIVE_UP_SEC = 45.0   # публичный RPC может видеть новый счёт с задержкой
 CURVE_START_VSOL = 30.0          # виртуальные SOL в кривой Pump.fun при создании
 CURVE_COMPLETE_REAL_SOL = 85.0   # ~столько реальных SOL нужно до миграции (приближённо)
 
@@ -227,6 +229,8 @@ class Coin:
     price_ticks: int = 0
     curve_ok: Optional[bool] = None
     curve_fail: int = 0
+    curve_missing: int = 0
+    curve_reason: str = ''
     migrated: bool = False
     dev_atas: List[str] = field(default_factory=list)
     dev_ata: Optional[str] = None
@@ -300,7 +304,7 @@ def _tag(row: Dict[str, Any]) -> str:
 OUTCOME_RU = {
     'dead': 'МЁРТВАЯ (сделок нет)', 'rug_dev_dump': 'СЛИВ СОЗДАТЕЛЕМ', 'pump_and_dump': 'ПАМП И СЛИВ',
     'pump': 'РОСТ', 'dump': 'ПАДЕНИЕ', 'flat': 'БЕЗ ДВИЖЕНИЯ',
-    'migrated': 'УШЛА НА DEX (кривая заполнена)', 'no_price': 'ЦЕНА НЕДОСТУПНА (не Pump.fun кривая)',
+    'migrated': 'УШЛА НА DEX (кривая заполнена)', 'no_price': 'ЦЕНА НЕДОСТУПНА',
 }
 
 
@@ -373,7 +377,7 @@ class TxtSink:
         name = f" ({r['name']})" if r.get('name') else ''
         return (f"{_local(r['created_utc'])} | НОВАЯ МОНЕТА | {r.get('symbol') or '?'}{name} | mint {r['mint']}"
                 f" | создатель {r.get('creator') or '?'} | создатель сразу купил на {r.get('dev_initial_buy_sol') or 0} SOL"
-                f" | стартовая капа {_cap(r.get('price0_sol'))}")
+                f" | стартовая капа {_cap(r.get('price0_sol'))} | площадка {r.get('pool') or '?'}")
 
     @staticmethod
     def _fmt_trades(r: Dict[str, Any]) -> str:
@@ -601,6 +605,25 @@ class CoinWatcher:
                     self._on_dev_balance(coin, 0.0, now)
 
     def _on_curve(self, coin: Coin, b64: Optional[str], now: float) -> None:
+        if not b64:
+            # счёт ещё не виден RPC-ноде (задержка) — ждём, а не сдаёмся сразу
+            coin.curve_missing += 1
+            if coin.curve_ok is None and now - coin.created_ts >= CURVE_NOT_FOUND_GIVE_UP_SEC:
+                coin.curve_ok = False
+                coin.curve_reason = 'not_found'
+                self.stats['curve_not_found'] += 1
+            return
+        try:
+            head = base64.b64decode(b64)[:8]
+        except (ValueError, TypeError):
+            head = b''
+        if head != PUMP_CURVE_DISCRIMINATOR:
+            coin.curve_fail += 1
+            if coin.curve_ok is None and coin.curve_fail >= 2:
+                coin.curve_ok = False      # счёт есть, но это не кривая Pump.fun (другой launchpad)
+                coin.curve_reason = 'other_launchpad'
+                self.stats['unsupported_curve'] += 1
+            return
         info = parse_pump_curve(b64)
         if info.get('curve_complete'):
             if not coin.migrated:
@@ -610,12 +633,11 @@ class CoinWatcher:
                 self.sink.write('dev', self._dev_row(coin, now, 'migrated', 0.0))
             return
         price = info.get('price_sol')
-        if info.get('status') != 'ok' or price is None or not info.get('curve_invariant_ok'):
-            coin.curve_fail += 1
-            if coin.curve_ok is None and coin.curve_fail >= 3:
-                coin.curve_ok = False      # не Pump.fun кривая (например, другой launchpad)
-                self.stats['unsupported_curve'] += 1
+        if info.get('status') != 'ok' or price is None:
+            self.stats['curve_parse_failed'] += 1
             return
+        if not info.get('curve_invariant_ok'):
+            self.stats['curve_nonstandard_k'] += 1     # другие стартовые резервы — цена всё равно верна
         coin.curve_ok = True
         rsol = int(info['curve_real_sol_raw']) / 1e9
         vsol = int(info['curve_virtual_sol_raw']) / 1e9
@@ -859,10 +881,11 @@ class CoinWatcher:
         lines = [
             f'Отчёт на {dt.datetime.now().astimezone():%Y-%m-%d %H:%M:%S}',
             f"Новых монет записано: {self.stats['coins_created']}, сейчас под наблюдением: {len(self.active)},"
-            f" досмотрено: {done}, сделок: {self.stats['trades']}",
+            f" досмотрено: {done}" + (f", сделок: {self.stats['trades']}" if self.cfg.price_source == 'trades' else ''),
             f"Источник цены: {'PumpPortal сделки' if self.cfg.price_source == 'trades' else f'Solana RPC, опрос кривой каждые ~{self.cfg.poll_sec:.0f} с'}"
             f" | изменений цены {self.stats['price_ticks']}, продаж создателем {self.stats['dev_sells']},"
-            f" ушли на DEX {self.stats['migrated']}, не Pump.fun кривая {self.stats['unsupported_curve']}",
+            f" ушли на DEX {self.stats['migrated']}, не Pump.fun кривая {self.stats['unsupported_curve']},"
+            f" кривая не найдена RPC {self.stats['curve_not_found']}",
             f"Движений цены: вверх {self.stats['moves_up']}, вниз {self.stats['moves_down']}"
             f" (порог {self.cfg.move_pct:.0f}%, окно {self.cfg.window_sec:.0f} с)",
             '', 'Исходы монет:',
@@ -946,7 +969,9 @@ class CoinWatcher:
         cf = change_final or 0.0
         rpc = self.cfg.price_source == 'rpc'
         if rpc and coin.curve_ok is False:
-            return 'no_price', ['unsupported_curve'], ['цена недоступна: это не стандартная кривая Pump.fun (другой launchpad)']
+            if coin.curve_reason == 'not_found':
+                return 'no_price', ['curve_not_found'], [f'цена недоступна: RPC не нашёл счёт кривой за {CURVE_NOT_FOUND_GIVE_UP_SEC:.0f} с']
+            return 'no_price', ['unsupported_curve'], [f'цена недоступна: это не кривая Pump.fun (площадка {coin.pool or "?"})']
         if trades == 0 and not coin.migrated and not coin.dev_sold_tokens:
             return 'dead', ['no_trades'], ['после создания сделок не было — монету никто не заметил (или купил только создатель)']
         if coin.migrated:

@@ -207,7 +207,7 @@ def curve_account(vsol_sol, complete=False):
     vsol = int(vsol_sol * 1e9)
     vtok = K0 // vsol
     rsol = vsol - 30 * 10 ** 9
-    raw = bytes(8) + struct.pack('<QQQQQ', vtok, vsol, 0, max(rsol, 0), 10 ** 15) + bytes([int(complete)]) + bytes(32)
+    raw = bytes.fromhex('17b7f83760d8ac60') + struct.pack('<QQQQQ', vtok, vsol, 0, max(rsol, 0), 10 ** 15) + bytes([int(complete)]) + bytes(32)
     return {'data': [base64.b64encode(raw).decode(), 'base64']}
 
 
@@ -290,14 +290,22 @@ def test_rpc_mode_unsupported_curve_and_migration(tmp_path):
     w.on_message(other, now=0.0)
     w.on_message(rpc_create(), now=0.0)
     garbage = {'data': [base64.b64encode(bytes(200)).decode(), 'base64']}
-    for t in (1.0, 2.0, 3.0):
+    late = dict(rpc_create(), mint='Late' + 'x' * 40, bondingCurveKey='Lag' + '1' * 41, initialBuy=0)
+    w.on_message(late, now=0.0)
+    for t in (1.0, 2.0, 3.0, 10.0, 20.0):
         batch = w.poll_accounts()
         vals = []
         for acct, mint, kind in batch:
-            vals.append(garbage if mint.startswith('Bonk') else (curve_account(115.0, complete=(t == 3.0)) if kind == 'curve' else None))
+            if mint.startswith('Bonk'):
+                vals.append(garbage)
+            elif mint.startswith('Late'):     # RPC видит счёт только через 20 с
+                vals.append(curve_account(33.0) if t >= 20.0 else None)
+            else:
+                vals.append(curve_account(115.0, complete=(t == 3.0)) if kind == 'curve' else None)
         w.on_accounts(batch, vals, now=t)
+    assert w.active['Late' + 'x' * 40].curve_ok is True and w.active['Late' + 'x' * 40].price_ticks == 1
     assert w.active['Bonk' + 'x' * 40].curve_ok is False
-    assert w.active[REAL_MINT].migrated and w.poll_accounts() == []
+    assert w.active[REAL_MINT].migrated and [m for _, m, _ in w.poll_accounts()] == ['Late' + 'x' * 40]
     w.tick(now=400.0)
     sink.close()
     summary = (run_dir / 'summary.txt').read_text(encoding='utf-8')
@@ -344,3 +352,20 @@ def test_config_never_leaks_keys(monkeypatch, tmp_path):
     monkeypatch.delenv('PUMPPORTAL_API_KEY')
     cfg = WatchConfig.from_env(str(tmp_path))
     assert cfg.price_source == 'rpc' and 'api-key' not in cfg.ws_url()
+
+
+def test_rpc_mode_gives_up_on_missing_curve_only_after_delay(tmp_path):
+    cfg = WatchConfig(out_dir=str(tmp_path), price_source='rpc')
+    run_dir = new_run_dir(str(tmp_path))
+    sink = TxtSink(run_dir)
+    w = CoinWatcher(cfg, sink, clock=lambda: 0.0)
+    w.on_message(dict(rpc_create(), initialBuy=0), now=0.0)
+    coin = w.active[REAL_MINT]
+    for t in (2.0, 4.0, 6.0, 20.0):
+        w.on_accounts(w.poll_accounts(), [None], now=t)
+    assert coin.curve_ok is None          # ещё ждём
+    w.on_accounts(w.poll_accounts(), [None], now=50.0)
+    assert coin.curve_ok is False and coin.curve_reason == 'not_found'
+    w.tick(now=400.0)
+    sink.close()
+    assert 'RPC не нашёл счёт кривой' in (run_dir / 'summary.txt').read_text(encoding='utf-8')
