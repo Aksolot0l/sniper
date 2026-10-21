@@ -1,6 +1,7 @@
 """CLI: python -m telemetry {run,export,status,backup,stop} --data-dir DIR
+     python -m telemetry {watch,watch-stop,watch-report} --out-dir DIR
 
-Only `run` touches the network (read-only). export/status/backup/stop are offline.
+Only `run` and `watch` touch the network (read-only). export/status/backup/stop are offline.
 """
 
 from __future__ import annotations
@@ -27,7 +28,43 @@ def main(argv=None) -> int:
         if name == 'export':
             cmd.add_argument('--zip', action='store_true')
             cmd.add_argument('--no-ingest', action='store_true', help='do not ingest bot spool first')
+    watch = sub.add_parser('watch', help='записывать ВСЕ новые монеты Pump.fun и следить за ценой N минут (сеть, только чтение)')
+    watch.add_argument('--out-dir', default='../coin_watch')
+    watch.add_argument('--window-sec', type=float, default=None, help='сколько следить за монетой (по умолчанию 300)')
+    watch.add_argument('--move-pct', type=float, default=None, help='порог движения цены для moves.csv (по умолчанию 20)')
+    watch.add_argument('--duration-sec', type=float, default=None, help='остановиться сам через N секунд')
+    watch.add_argument('--no-trades', action='store_true', help='не писать trades.csv (экономия диска)')
+    wstop = sub.add_parser('watch-stop', help='мягко остановить watch (создаёт OUT_DIR/STOP)')
+    wstop.add_argument('--out-dir', default='../coin_watch')
+    wrep = sub.add_parser('watch-report', help='офлайн-сводка по одному запуску watch')
+    wrep.add_argument('run_dir', nargs='?', default=None, help='папка run_...; по умолчанию последняя')
+    wrep.add_argument('--out-dir', default='../coin_watch')
     args = parser.parse_args(argv)
+
+    if args.cmd == 'watch':
+        from .watch import WatchConfig, run_watch
+        cfg = WatchConfig.from_env(args.out_dir, window_sec=args.window_sec, move_pct=args.move_pct,
+                                   duration_sec=args.duration_sec)
+        if args.no_trades:
+            cfg.record_trades = False
+        return run_watch(cfg)
+    if args.cmd == 'watch-stop':
+        out = Path(args.out_dir)
+        out.mkdir(parents=True, exist_ok=True)
+        (out / 'STOP').write_text('stop requested\n', encoding='utf-8')
+        print(f'stop requested: {out / "STOP"} (watcher закроет окна и остановится в течение ~1 с)')
+        return 0
+    if args.cmd == 'watch-report':
+        from .watch import report
+        run_dir = args.run_dir
+        if run_dir is None:
+            runs = sorted(Path(args.out_dir).glob('run_*'))
+            if not runs:
+                print('нет запусков в', args.out_dir)
+                return 1
+            run_dir = runs[-1]
+        print(json.dumps({'run_dir': str(run_dir), **report(run_dir)}, ensure_ascii=False, indent=2))
+        return 0
 
     from .store import DB_NAME, ensure_data_dir
     root = ensure_data_dir(args.data_dir)

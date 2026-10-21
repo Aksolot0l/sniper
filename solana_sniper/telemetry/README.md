@@ -151,3 +151,39 @@ TELEMETRY_DIR=../telemetry_data python main.py
 7. Quote-метки гипотетические: без комиссий/priority fee, не являются fill.
 8. Если бот и collector работают одновременно, это две подписки PumpPortal (рекомендация провайдера — не плодить соединения).
 9. `main.py`/`ws_client.py` используют синтаксис f-строк Python 3.12+; тесты и пакет телеметрии работают на 3.11+.
+
+## Coin watcher — все новые монеты + цена 5 минут (`python -m telemetry watch`)
+
+Отдельный простой режим, не связан с ботом и SQLite. Одно WebSocket-подключение к
+PumpPortal (`subscribeNewToken` + `subscribeTokenTrade` на каждую новую монету,
+`unsubscribeTokenTrade` после окна). Только чтение: ключи не нужны, транзакций нет.
+Цена = `vSolInBondingCurve / vTokensInBondingCurve` из каждой сделки.
+
+Каждый запуск пишет в новую папку `../coin_watch/run_YYYYmmdd_HHMMSSZ/` (старые не трогаются):
+
+| файл | что внутри |
+|---|---|
+| `coins.csv` | каждая созданная монета сразу при создании: время, mint, тикер, создатель, стартовая покупка dev, стартовая цена/капа |
+| `trades.csv` | каждая сделка в окне: сторона, SOL, токены, кошелёк, это создатель?, ранний покупатель?, цена, % от старта, заполнение кривой |
+| `moves.csv` | движения цены ≥ `--move-pct` (20%) от прошлой точки: `up`/`down`, длительность, покупки/продажи, `reason_codes` + `why` (гипотезы) |
+| `summary.csv` | итог по монете через `--window-sec` (300 с): старт/макс/мин/итог, время пика, dev продал %, ранние продали, исход и `ideas` |
+| `watch.log` | статус раз в 30 с, разрывы соединения |
+
+Исходы: `dead` (сделок нет), `rug_dev_dump` (создатель продал ≥50% и цена рухнула),
+`pump_and_dump` (+100% и потом −50% от пика), `pump` (итог ≥ +50%), `dump` (итог ≤ −30%), `flat`.
+Коды причин движений: вверх — `whale_buy`, `buy_wave`, `repeat_buyer`, `dev_buy`, `early_snipers`, `curve_hype`;
+вниз — `dev_sell`, `whale_sell`, `early_buyers_exit`, `sell_pressure`, `no_buyers`, `fast_crash`; иначе `small_flow`.
+Это эвристики-гипотезы, а не доказанные причины (соцсети/Twitter/Telegram не видны).
+
+```bash
+cd solana_sniper
+python -m telemetry watch                       # до Ctrl+C
+python -m telemetry watch --duration-sec 3600   # сам остановится через час
+python -m telemetry watch-stop                  # мягкая остановка из другого терминала
+python -m telemetry watch-report                # сводка по последнему запуску
+```
+
+Ограничения: сделки, пришедшие до подписки (первые доли секунды) и во время разрыва
+соединения, пропускаются; после миграции на PumpSwap/Raydium сделки могут не приходить;
+при остановке недосмотренные монеты попадают в `summary.csv` с `complete=0`.
+Объём: ~20–30 тыс. монет/сутки, `trades.csv` порядка сотен МБ/сутки (`--no-trades` отключает).
