@@ -1,0 +1,10 @@
+__pycache__/
+*.py[cod]
+.venv*/
+# Данные телеметрии (SQLite/JSONL/выгрузки) не коммитим: они живут вне Git.
+telemetry_data/
+# Архивы прогонов, кошельки и базы бота не переносим в эту ветку.
+solana_sniper/runs/
+solana_sniper/wallet.json
+solana_sniper/sniper.db
+solana_sniper/trades.log
