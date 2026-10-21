@@ -1,0 +1,52 @@
+# Запуск coin watcher на GitHub Actions (у раннера есть доступ к PumpPortal).
+# Только чтение: одно WebSocket-подключение к PumpPortal, без ключей и транзакций.
+# Запускается при пуше в эту ветку, если изменился этот файл или coin_watch_request.txt.
+# Результаты коммитятся обратно в ветку в папку coin_watch_results/run_.../
+name: coin-watch
+
+on:
+  push:
+    branches: ['arena/12e9063e-sniper']
+    paths: ['.github/workflows/coin-watch.yml', 'coin_watch_request.txt']
+  workflow_dispatch:
+
+permissions:
+  contents: write
+
+concurrency:
+  group: coin-watch
+  cancel-in-progress: false
+
+jobs:
+  watch:
+    runs-on: ubuntu-latest
+    timeout-minutes: 45
+    env:
+      DURATION_SEC: '1500'   # 25 минут: монеты первых ~20 минут досматриваются полные 5 минут
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-python@v5
+        with:
+          python-version: '3.12'
+      - run: pip install 'websockets>=12.0'
+      - name: Run coin watcher
+        working-directory: solana_sniper
+        run: python -m telemetry watch --out-dir ../coin_watch --duration-sec "$DURATION_SEC"
+      - name: Commit results
+        if: always()
+        run: |
+          mkdir -p coin_watch_results
+          for d in coin_watch/run_*; do
+            [ -d "$d" ] || continue
+            dest="coin_watch_results/$(basename "$d")"
+            cp -r "$d" "$dest"
+            for f in "$dest"/*.txt; do   # GitHub не принимает файлы > 100 МБ
+              if [ "$(stat -c %s "$f")" -gt 50000000 ]; then gzip -9 "$f"; fi
+            done
+            ls -la "$dest"
+          done
+          git config user.name 'coin-watch bot'
+          git config user.email 'actions@users.noreply.github.com'
+          git add -f coin_watch_results
+          git commit -m "coin watch results $(date -u +%Y-%m-%dT%H:%MZ)" || exit 0
+          for i in 1 2 3; do git pull --rebase -q && git push && break; sleep 5; done
