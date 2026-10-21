@@ -6,7 +6,7 @@ import asyncio
 import csv
 import json
 
-from telemetry.watch import CoinWatcher, CsvSink, WatchConfig, new_run_dir, report, watch_loop
+from telemetry.watch import CoinWatcher, CsvSink, TxtSink, WatchConfig, new_run_dir, report, watch_loop
 
 CREATOR = 'Creator1111111111111111111111111111111111'
 SNIPER = 'Sniper22222222222222222222222222222222222'
@@ -142,7 +142,7 @@ def test_watch_loop_subscribes_unsubscribes_and_writes_report(tmp_path):
         holder['ws'] = FakeWS(msgs, stop)
         return holder['ws']
 
-    cfg = WatchConfig(out_dir=str(tmp_path), window_sec=3.0, status_every_sec=1e9)
+    cfg = WatchConfig(out_dir=str(tmp_path), window_sec=3.0, status_every_sec=1e9, output_format='csv')
     run_dir = new_run_dir(str(tmp_path))
     result = asyncio.run(watch_loop(cfg, run_dir, ws_connect=connect, clock=tick_clock, stop_event=stop))
     sent = holder['ws'].sent
@@ -154,3 +154,29 @@ def test_watch_loop_subscribes_unsubscribes_and_writes_report(tmp_path):
     rep = report(run_dir)
     assert rep['coins_created'] == 1 and rep['coins_finished'] == 1
     assert rep['move_reasons_up'].get('whale_buy') == 1
+
+
+def test_txt_format_is_default_and_readable(tmp_path):
+    assert WatchConfig().output_format == 'txt'
+    cfg = WatchConfig(out_dir=str(tmp_path), window_sec=300, move_pct=20)
+    run_dir = new_run_dir(str(tmp_path))
+    sink = TxtSink(run_dir)
+    w = CoinWatcher(cfg, sink, clock=lambda: 0.0)
+    w.on_message(create(), now=0.0)
+    w.on_message(trade('buy', SNIPER, 3.0, 80_000_000, 38.0, 850_000_000), now=2.0)
+    w.on_message(trade('buy', WHALE, 2.0, 40_000_000, 40.0, 810_000_000), now=20.0)
+    w.on_message(trade('sell', CREATOR, 2.5, 30_000_000, 31.0, 1_050_000_000), now=60.0)
+    w.tick(now=300.0)
+    (run_dir / 'report.txt').write_text(w.report_text(), encoding='utf-8')
+    sink.close()
+    assert not list(run_dir.glob('*.csv'))
+    read = lambda n: (run_dir / f'{n}.txt').read_text(encoding='utf-8')
+    assert 'НОВАЯ МОНЕТА' in read('coins') and create()['mint'] in read('coins')
+    assert 'ПОКУПКА 3.0 SOL' in read('trades') and '(СОЗДАТЕЛЬ)' in read('trades')
+    assert '▲ ВВЕРХ' in read('moves') and '▼ ВНИЗ' in read('moves') and 'ПОЧЕМУ:' in read('moves')
+    assert 'ИСХОД: СЛИВ СОЗДАТЕЛЕМ' in read('summary') and 'ИДЕИ ПОЧЕМУ' in read('summary')
+    everything = read('all')
+    assert everything.index('НОВАЯ МОНЕТА') < everything.index('▲ ВВЕРХ') < everything.index('===== ИТОГ')
+    assert 'ПОКУПКА' not in everything        # сделки только в trades.txt
+    rep = read('report')
+    assert 'Новых монет записано: 1' in rep and 'СЛИВ СОЗДАТЕЛЕМ: 1' in rep and 'создатель продаёт (dev_sell)' in rep

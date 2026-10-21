@@ -5,12 +5,15 @@ subscribeTokenTrade по каждой новой монете). Никаких �
 транзакций и запросов к кошельку. Цена берётся прямо из сделок
 (vSolInBondingCurve / vTokensInBondingCurve), поэтому нет лимитов HTTP API.
 
-Файлы одного запуска (OUT_DIR/run_YYYYmmdd_HHMMSSZ/):
-  coins.csv    — каждая созданная монета (строка пишется сразу при создании)
-  trades.csv   — каждая сделка по монете в окне наблюдения (можно отключить)
-  moves.csv    — движения цены >= MOVE_PCT от предыдущей точки: вверх/вниз + гипотезы «почему»
-  summary.csv  — итог по монете после окна (по умолчанию 5 минут): макс/мин/итог, исход, идеи
+Файлы одного запуска (OUT_DIR/run_YYYYmmdd_HHMMSSZ/), по умолчанию обычный текст:
+  all.txt      — всё подряд по времени: новые монеты, движения цены, итоги (без отдельных сделок)
+  coins.txt    — каждая созданная монета (строка пишется сразу при создании)
+  trades.txt   — каждая сделка по монете в окне наблюдения (можно отключить)
+  moves.txt    — движения цены >= MOVE_PCT от предыдущей точки: вверх/вниз + гипотезы «почему»
+  summary.txt  — итог по монете после окна (по умолчанию 5 минут): макс/мин/итог, исход, идеи
+  report.txt   — общая статистика запуска (обновляется по ходу работы)
   watch.log    — статус раз в N секунд, переподключения, ошибки
+С --format csv вместо *.txt пишутся coins/trades/moves/summary.csv (для таблиц/анализа).
 """
 
 from __future__ import annotations
@@ -110,6 +113,7 @@ class WatchConfig:
     status_every_sec: float = 30.0
     max_active: int = 5000             # предохранитель от неограниченного роста подписок
     url: str = 'wss://pumpportal.fun/api/data'
+    output_format: str = 'txt'         # 'txt' (читаемый текст) или 'csv'
 
     @classmethod
     def from_env(cls, out_dir: str, **overrides: Any) -> 'WatchConfig':
@@ -123,6 +127,7 @@ class WatchConfig:
             record_trades=env.get('WATCH_RECORD_TRADES', 'on').lower() not in ('0', 'off', 'false', 'no'),
             duration_sec=_f(env.get('WATCH_DURATION_SEC')) or None,
             url=env.get('WATCH_PUMPPORTAL_URL', cls.url),
+            output_format=env.get('WATCH_FORMAT', 'txt').lower(),
         )
         for key, value in overrides.items():
             if value is not None:
@@ -217,6 +222,124 @@ class CsvSink:
                 pass
 
 
+def _local(iso: Any) -> str:
+    try:
+        moment = dt.datetime.fromisoformat(str(iso).replace('Z', '+00:00'))
+    except ValueError:
+        return str(iso)
+    return moment.astimezone().strftime('%Y-%m-%d %H:%M:%S')
+
+
+def _cap(price: Any) -> str:
+    """Цена токена -> капитализация в SOL (у Pump.fun 1 млрд токенов) — так читать проще."""
+    value = _f(price)
+    return f'{value * PUMP_TOTAL_SUPPLY:.1f} SOL' if value else '?'
+
+
+def _sgn(value: Any, suffix: str = '%') -> str:
+    v = _f(value)
+    return '?' if v is None else f'{v:+.1f}{suffix}'
+
+
+def _tag(row: Dict[str, Any]) -> str:
+    sym = row.get('symbol') or '?'
+    return f"{sym} [{row.get('mint', '')}]"
+
+
+OUTCOME_RU = {
+    'dead': 'МЁРТВАЯ (сделок нет)', 'rug_dev_dump': 'СЛИВ СОЗДАТЕЛЕМ', 'pump_and_dump': 'ПАМП И СЛИВ',
+    'pump': 'РОСТ', 'dump': 'ПАДЕНИЕ', 'flat': 'БЕЗ ДВИЖЕНИЯ',
+}
+
+
+REASON_RU = {
+    'whale_buy': 'крупная покупка', 'buy_wave': 'волна покупок от многих кошельков',
+    'repeat_buyer': 'один кошелёк покупает много раз', 'dev_buy': 'создатель докупает',
+    'early_snipers': 'снайперы в первые секунды', 'curve_hype': 'кривая заполнена, ждут миграции',
+    'dev_sell': 'создатель продаёт', 'whale_sell': 'крупная продажа',
+    'early_buyers_exit': 'ранние покупатели фиксируют прибыль', 'sell_pressure': 'продаж больше покупок',
+    'no_buyers': 'покупки прекратились', 'fast_crash': 'резкий обвал за секунды',
+    'small_flow': 'без явной причины (мелкие сделки)',
+}
+
+
+class TxtSink:
+    """Читаемые .txt файлы (append-only, сброс на диск после каждой строки) + общий all.txt."""
+
+    def __init__(self, run_dir: Path, record_trades: bool = True) -> None:
+        self.run_dir = run_dir
+        names = ['all', 'coins', 'moves', 'summary'] + (['trades'] if record_trades else [])
+        self._files = {n: open(run_dir / f'{n}.txt', 'a', encoding='utf-8') for n in names}
+        self.counts: Counter = Counter()
+
+    def _put(self, name: str, text: str) -> None:
+        fh = self._files.get(name)
+        if fh is not None:
+            fh.write(text + '\n')
+            fh.flush()
+
+    def write(self, table: str, row: Dict[str, Any]) -> None:
+        if table == 'trades' and 'trades' not in self._files:
+            return
+        text = getattr(self, f'_fmt_{table}')(row) + ('\n' if table == 'summary' else '')
+        self._put(table, text)
+        if table != 'trades':
+            self._put('all', text)
+        self.counts[table] += 1
+
+    @staticmethod
+    def _fmt_coins(r: Dict[str, Any]) -> str:
+        name = f" ({r['name']})" if r.get('name') else ''
+        return (f"{_local(r['created_utc'])} | НОВАЯ МОНЕТА | {r.get('symbol') or '?'}{name} | mint {r['mint']}"
+                f" | создатель {r.get('creator') or '?'} | создатель сразу купил на {r.get('dev_initial_buy_sol') or 0} SOL"
+                f" | стартовая капа {_cap(r.get('price0_sol'))}")
+
+    @staticmethod
+    def _fmt_trades(r: Dict[str, Any]) -> str:
+        who = ' (СОЗДАТЕЛЬ)' if str(r.get('is_creator')) == '1' else (
+            ' (ранний покупатель)' if str(r.get('is_early_buyer')) == '1' else '')
+        side = 'ПОКУПКА' if r['side'] == 'buy' else 'ПРОДАЖА'
+        return (f"{_local(r['recv_utc'])} | +{r['age_sec']}с | {_tag(r)} | {side} {r['sol']} SOL"
+                f" | кошелёк {r['trader']}{who} | капа {_cap(r.get('price_sol'))}"
+                f" ({_sgn(r.get('change_from_start_pct'))} от старта) | кривая {r.get('curve_progress_pct') or '?'}%")
+
+    @staticmethod
+    def _fmt_moves(r: Dict[str, Any]) -> str:
+        arrow = '▲ ВВЕРХ' if r['direction'] == 'up' else '▼ ВНИЗ'
+        return (f"{_local(r['recv_utc'])} | +{r['age_sec']}с | {_tag(r)} | {arrow} {_sgn(r['move_pct'])}"
+                f" за {r['move_duration_sec']}с | капа {_cap(r['from_price_sol'])} -> {_cap(r['to_price_sol'])}"
+                f" ({_sgn(r.get('change_from_start_pct'))} от старта) | покупок {r['buys']} на {r['sol_in']} SOL,"
+                f" продаж {r['sells']} на {r['sol_out']} SOL | ПОЧЕМУ: {r['why']}")
+
+    @staticmethod
+    def _fmt_summary(r: Dict[str, Any]) -> str:
+        done = '' if str(r.get('complete')) == '1' else ' (НЕ ДОСМОТРЕНА — запуск остановлен раньше)'
+        lines = [
+            f"===== ИТОГ {r.get('symbol') or '?'} [{r['mint']}] через {r['watched_sec']}с{done} =====",
+            f"  создана: {_local(r['created_utc'])}, создатель {r.get('creator') or '?'}",
+            f"  ИСХОД: {OUTCOME_RU.get(r['outcome'], r['outcome'])}",
+            f"  капа: старт {_cap(r['price0_sol'])} | максимум {_cap(r['price_max_sol'])} ({_sgn(r['max_up_pct'])}"
+            f" на {r['t_max_sec'] or '?'}с) | минимум {_cap(r['price_min_sol'])} ({_sgn(r['max_down_pct'])})"
+            f" | в конце {_cap(r['price_final_sol'])} ({_sgn(r['change_final_pct'])}, от пика {_sgn(r['drawdown_from_peak_pct'])})",
+            f"  сделки: {r['trades']} (покупок {r['buys']} на {r['sol_in']} SOL, продаж {r['sells']} на {r['sol_out']} SOL),"
+            f" покупателей {r['unique_buyers']}, продавцов {r['unique_sellers']}",
+            f"  движений: вверх {r['moves_up']}, вниз {r['moves_down']} | крупнейшая покупка {r['largest_buy_sol']} SOL,"
+            f" продажа {r['largest_sell_sol']} SOL",
+            f"  создатель: купил при создании {r['dev_initial_buy_sol']} SOL, продал {r['dev_sold_pct'] or 0}% токенов"
+            + (f" (первая продажа на {r['dev_first_sell_sec']}с)" if r.get('dev_first_sell_sec') not in ('', None) else '')
+            + f", ранних покупателей {r['early_buyers']}, из них продали {r['early_buyers_sold']}",
+            f"  ИДЕИ ПОЧЕМУ: {r['ideas']}",
+        ]
+        return '\n'.join(lines)
+
+    def close(self) -> None:
+        for fh in self._files.values():
+            try:
+                fh.close()
+            except OSError:
+                pass
+
+
 class CoinWatcher:
     """Чистая логика без сети: сообщения PumpPortal -> строки CSV + (от)подписки."""
 
@@ -226,6 +349,9 @@ class CoinWatcher:
         self.clock = clock
         self.active: Dict[str, Coin] = {}
         self.stats: Counter = Counter()
+        self.move_reasons: Dict[str, Counter] = {'up': Counter(), 'down': Counter()}
+        self.max_ups: List[float] = []
+        self.outcomes: Counter = Counter()
 
     # ---------------------------------------------------------------- input
     def on_message(self, msg: Any, now: Optional[float] = None) -> List[str]:
@@ -352,6 +478,7 @@ class CoinWatcher:
         else:
             coin.moves_down += 1
         coin.move_codes.update(codes)
+        self.move_reasons[direction].update(codes)
         self.stats[f'moves_{direction}'] += 1
         coin.anchor_price, coin.anchor_ts, coin.window = price, now, []
 
@@ -422,6 +549,31 @@ class CoinWatcher:
                        + (f' (покупки {sol_in:.2f} SOL / продажи {sol_out:.2f} SOL)' if trades else ''))
         return codes, why
 
+    def report_text(self) -> str:
+        done = sum(self.outcomes.values())
+        ups = sorted(self.max_ups)
+        lines = [
+            f'Отчёт на {dt.datetime.now().astimezone():%Y-%m-%d %H:%M:%S}',
+            f"Новых монет записано: {self.stats['coins_created']}, сейчас под наблюдением: {len(self.active)},"
+            f" досмотрено: {done}, сделок: {self.stats['trades']}",
+            f"Движений цены: вверх {self.stats['moves_up']}, вниз {self.stats['moves_down']}"
+            f" (порог {self.cfg.move_pct:.0f}%, окно {self.cfg.window_sec:.0f} с)",
+            '', 'Исходы монет:',
+        ]
+        for code, n in self.outcomes.most_common():
+            lines.append(f'  {OUTCOME_RU.get(code, code)}: {n} ({n / done * 100:.1f}%)')
+        if ups:
+            lines += ['', f'Максимальный рост от старта: медиана {ups[len(ups) // 2]:+.0f}%,'
+                          f' выросли на 100%+ : {sum(1 for u in ups if u >= 100)} монет,'
+                          f' на 500%+ : {sum(1 for u in ups if u >= 500)} монет']
+        for direction, title in (('up', 'Частые причины роста'), ('down', 'Частые причины падения')):
+            if self.move_reasons[direction]:
+                lines += ['', f'{title}:'] + [f'  {REASON_RU.get(c, c)} ({c}): {n}'
+                                                  for c, n in self.move_reasons[direction].most_common(10)]
+        if self.stats['disconnects']:
+            lines += ['', f"Обрывов соединения: {self.stats['disconnects']} (сделки в это время пропущены)"]
+        return '\n'.join(lines) + '\n'
+
     # -------------------------------------------------------------- expiry
     def tick(self, now: Optional[float] = None) -> List[str]:
         """Закрыть монеты, чьё окно истекло. Возвращает mint для отписки."""
@@ -449,6 +601,9 @@ class CoinWatcher:
         dev_sold_pct = (coin.dev_sold_tokens / coin.dev_tokens * 100.0) if coin.dev_tokens else None
         outcome, codes, ideas = self.classify(coin, change_final, max_up, from_peak, dev_sold_pct, now)
         self.stats[f'outcome_{outcome}'] += 1
+        self.outcomes[outcome] += 1
+        if max_up is not None and trades:
+            self.max_ups.append(max_up)
         self.sink.write('summary', {
             'mint': coin.mint, 'symbol': coin.symbol, 'name': coin.name, 'creator': coin.creator,
             'created_utc': coin.created_utc, 'watched_sec': _r(now - coin.created_ts, 1),
@@ -554,8 +709,14 @@ async def watch_loop(cfg: WatchConfig, run_dir: Path, *, ws_connect: Any = None,
     if ws_connect is None:  # pragma: no cover - real network only
         import websockets
         ws_connect = websockets.connect
-    sink = CsvSink(run_dir, cfg.record_trades)
+    sink = (CsvSink if cfg.output_format == 'csv' else TxtSink)(run_dir, cfg.record_trades)
     watcher = CoinWatcher(cfg, sink, clock)
+
+    def write_report() -> None:
+        try:
+            (run_dir / 'report.txt').write_text(watcher.report_text(), encoding='utf-8')
+        except OSError:
+            pass
     started = clock()
     last_status = started
     backoff = 1.0
@@ -600,6 +761,7 @@ async def watch_loop(cfg: WatchConfig, run_dir: Path, *, ws_connect: Any = None,
                             await ws.send(json.dumps({'method': 'unsubscribeTokenTrade', 'keys': expired}))
                         if clock() - last_status >= cfg.status_every_sec:
                             last_status = clock()
+                            write_report()
                             _log(run_dir, 'status ' + json.dumps({
                                 'coins': watcher.stats['coins_created'], 'watching': len(watcher.active),
                                 'trades': watcher.stats['trades'], 'moves_up': watcher.stats['moves_up'],
@@ -620,6 +782,7 @@ async def watch_loop(cfg: WatchConfig, run_dir: Path, *, ws_connect: Any = None,
     finally:
         unfinished = watcher.finalize_all()
         sink.close()
+        write_report()
         result = {'run_dir': str(run_dir), 'files': dict(sink.counts), 'stats': dict(watcher.stats),
                   'unfinished_at_stop': unfinished}
         _log(run_dir, 'stopped ' + json.dumps(result, ensure_ascii=False))
@@ -650,6 +813,7 @@ def run_watch(cfg: WatchConfig) -> int:  # pragma: no cover - real network only
     if (root / 'STOP').exists():
         (root / 'STOP').unlink()
     run_dir = new_run_dir(str(root))
+    print(f'Пишу файлы в: {run_dir}', flush=True)
     (root / 'watch.pid').write_text(str(os.getpid()), encoding='utf-8')
     (run_dir / 'config.json').write_text(json.dumps(cfg.__dict__, indent=2), encoding='utf-8')
 

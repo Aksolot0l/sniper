@@ -33,7 +33,8 @@ def main(argv=None) -> int:
     watch.add_argument('--window-sec', type=float, default=None, help='сколько следить за монетой (по умолчанию 300)')
     watch.add_argument('--move-pct', type=float, default=None, help='порог движения цены для moves.csv (по умолчанию 20)')
     watch.add_argument('--duration-sec', type=float, default=None, help='остановиться сам через N секунд')
-    watch.add_argument('--no-trades', action='store_true', help='не писать trades.csv (экономия диска)')
+    watch.add_argument('--no-trades', action='store_true', help='не писать сделки (trades.txt/csv), экономия диска')
+    watch.add_argument('--format', choices=('txt', 'csv'), default=None, help='txt (по умолчанию, читаемый текст) или csv')
     wstop = sub.add_parser('watch-stop', help='мягко остановить watch (создаёт OUT_DIR/STOP)')
     wstop.add_argument('--out-dir', default='../coin_watch')
     wrep = sub.add_parser('watch-report', help='офлайн-сводка по одному запуску watch')
@@ -45,6 +46,8 @@ def main(argv=None) -> int:
         from .watch import WatchConfig, run_watch
         cfg = WatchConfig.from_env(args.out_dir, window_sec=args.window_sec, move_pct=args.move_pct,
                                    duration_sec=args.duration_sec)
+        if args.format:
+            cfg.output_format = args.format
         if args.no_trades:
             cfg.record_trades = False
         return run_watch(cfg)
@@ -63,6 +66,10 @@ def main(argv=None) -> int:
                 print('нет запусков в', args.out_dir)
                 return 1
             run_dir = runs[-1]
+        if not (Path(run_dir) / 'summary.csv').exists():
+            txt = Path(run_dir) / 'report.txt'
+            print(txt.read_text(encoding='utf-8') if txt.exists() else f'нет report.txt в {run_dir}')
+            return 0
         print(json.dumps({'run_dir': str(run_dir), **report(run_dir)}, ensure_ascii=False, indent=2))
         return 0
 
